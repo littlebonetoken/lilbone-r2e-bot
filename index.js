@@ -135,10 +135,10 @@ bot.on('text', async (ctx) => {
   // already has ticket?
   const exists = db.prepare('SELECT * FROM tickets WHERE user_id=? OR wallet=?').get(ctx.from.id, address);
   if (exists) {
-    expectingWallet.delete(ctx.from.id);
-    return ctx.reply(`✅ You already have a ticket: **${exists.ticket_no}**`,
-      { parse_mode: 'Markdown' });
-  }
+  expectingWallet.delete(ctx.from.id);
+  return ctx.reply('✅ You already have a Golden Ticket!', homeKeyboard);
+}
+
 
   try {
     await ctx.reply('⏳ Verifying your $LILBONE balance…');
