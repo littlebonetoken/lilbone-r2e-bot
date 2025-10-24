@@ -1,23 +1,25 @@
-// LILBONE R2E Lottery Bot — wallet check + ticket
+// LILBONE R2E Lottery Bot — wallet check + ticket (auto-decimals + fixes)
 
 const express = require('express');
 const { Telegraf, Markup } = require('telegraf');
 const Database = require('better-sqlite3');
 const { Connection, PublicKey } = require('@solana/web3.js');
-const { getAssociatedTokenAddress, getAccount } = require('@solana/spl-token');
+const { getAssociatedTokenAddress, getAccount, getMint } = require('@solana/spl-token');
 
 // --- ENV
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const ADMIN_CHAT_ID = Number(process.env.ADMIN_CHAT_ID);
 const RPC_URL = process.env.RPC_URL || 'https://api.mainnet-beta.solana.com';
-const TOKEN_MINT = process.env.TOKEN_MINT; // LILBONE mint
+const TOKEN_MINT = process.env.TOKEN_MINT; // ⚠️ Mint address EXACTE (depuis Solscan)
 const MIN_HOLD = Number(process.env.MIN_HOLD || 400000);
-const DECIMALS = Number(process.env.TOKEN_DECIMALS || 9); // ajuste si besoin
+// ❌ SUPPRIMÉ: TOKEN_DECIMALS (on les lit on-chain)
 
+// Sanity checks
 if (!BOT_TOKEN) throw new Error('BOT_TOKEN missing');
 if (!TOKEN_MINT) throw new Error('TOKEN_MINT missing');
 if (!ADMIN_CHAT_ID) console.warn('⚠️ ADMIN_CHAT_ID is empty: admin notifications disabled.');
 
+// --- App & Bot
 const bot = new Telegraf(BOT_TOKEN);
 const app = express();
 app.use(express.json());
@@ -37,7 +39,23 @@ CREATE TABLE IF NOT EXISTS tickets (
 
 // --- Solana
 const conn = new Connection(RPC_URL, 'confirmed');
-const MINT_PK = new PublicKey(TOKEN_MINT);
+
+let MINT_PK;
+try {
+  MINT_PK = new PublicKey(TOKEN_MINT.trim());
+} catch (e) {
+  console.error('❌ TOKEN_MINT is not a valid Solana address:', TOKEN_MINT);
+  process.exit(1);
+}
+
+// Cache des décimales pour éviter de recharger à chaque appel
+let MINT_DECIMALS = null;
+async function getMintDecimals() {
+  if (MINT_DECIMALS !== null) return MINT_DECIMALS;
+  const mintInfo = await getMint(conn, MINT_PK);
+  MINT_DECIMALS = mintInfo.decimals ?? 9;
+  return MINT_DECIMALS;
+}
 
 // --- tiny in-memory state for expecting wallet (avoid extra deps)
 const expectingWallet = new Map(); // key: user_id -> true/false
@@ -51,16 +69,21 @@ const genTicketNo = () =>
   'LB-' + Math.random().toString(36).slice(2, 6).toUpperCase() + '-' +
   Math.random().toString(36).slice(2, 6).toUpperCase();
 
+/**
+ * Retourne { bal, decimals }
+ * bal = balance du token LILBONE (format humain)
+ */
 async function getTokenBalance(ownerStr) {
   const owner = new PublicKey(ownerStr);
+  const decimals = await getMintDecimals();           // ← récupère les décimales réelles (cache)
   const ata = await getAssociatedTokenAddress(MINT_PK, owner, false);
   try {
     const acc = await getAccount(conn, ata);
-    const bal = Number(acc.amount) / 10 ** DECIMALS;
-    return bal;
+    const bal = Number(acc.amount) / 10 ** decimals;  // conversion correcte
+    return { bal, decimals };
   } catch (e) {
-    // No token account = 0
-    return 0;
+    // Pas de compte token => 0
+    return { bal: 0, decimals };
   }
 }
 
@@ -93,8 +116,10 @@ bot.action('my_ticket', async (ctx) => {
   try { await ctx.answerCbQuery(); } catch {}
   const row = db.prepare('SELECT ticket_no, wallet FROM tickets WHERE user_id=?').get(ctx.from.id);
   if (!row) return ctx.reply('❌ No ticket found. Link your wallet first.', homeKeyboard);
-  return ctx.reply(`🎟 Your Golden Ticket: **${row.ticket_no}**\n🔗 Wallet: \`${row.wallet}\``,
-    { parse_mode: 'Markdown' });
+  return ctx.reply(
+    `🎟 Your Golden Ticket: **${row.ticket_no}**\n🔗 Wallet: \`${row.wallet}\``,
+    { parse_mode: 'Markdown' }
+  );
 });
 
 // --- text handler: capture wallet when expected
@@ -117,13 +142,13 @@ bot.on('text', async (ctx) => {
 
   try {
     await ctx.reply('⏳ Verifying your $LILBONE balance…');
-    const bal = await getTokenBalance(address);
+    const { bal, decimals } = await getTokenBalance(address);
 
     if (bal < MIN_HOLD) {
       expectingWallet.delete(ctx.from.id);
       return ctx.reply(
         `❌ Not enough $LILBONE.\n` +
-        `You hold **${Math.floor(bal).toLocaleString()}**, need **${MIN_HOLD.toLocaleString()}+**.`,
+        `You hold **${Math.floor(bal).toLocaleString()}** (decimals: ${decimals}), need **${MIN_HOLD.toLocaleString()}+**.`,
         { parse_mode: 'Markdown' }
       );
     }
